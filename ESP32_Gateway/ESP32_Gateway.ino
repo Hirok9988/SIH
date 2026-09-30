@@ -2,22 +2,15 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>            // NTP-based Unix timestamp
-#include <Wire.h>            // I2C bus (MLX90614, MAX30102)
-#include <Adafruit_MLX90614.h> // IR body temperature sensor
-#include <MAX30105.h>          // MAX30102 heart-rate / SpO2 sensor
-#include <heartRate.h>         // SparkFun beat-detection helper
-#include <DHT.h>               // DHT22 ambient temp/humidity
 
-// --- Sensor Pin & Type Config ---
-#define DHT_PIN     4          // GPIO pin connected to DHT22 DATA
-#define DHT_TYPE    DHT22
-#define BP_RX_PIN   16         // GPIO16 = RX2  (Serial2) <- BP module TX
-#define BP_TX_PIN   17         // GPIO17 = TX2  (Serial2) -> BP module RX
-
-// --- Sensor Objects ---
-Adafruit_MLX90614 mlx;
-MAX30105          particleSensor;
-DHT               dht(DHT_PIN, DHT_TYPE);
+// =============================================================================
+// RANDOMISED VITALS MODE
+// Simulates realistic sensor output with bounded random values.
+// Blood pressure updates every BP_INTERVAL ms (~30 min) since it cannot
+// realistically be measured every 10 seconds.
+// All other vitals (HR, SpO2, temp, humidity) update every `interval` (10 s).
+// MQTT pipeline, JSON field names, and topic are identical to the demo file.
+// =============================================================================
 
 // --- WiFi & MQTT Configuration ---
 const char* ssid = "Pixel_1811";
@@ -31,7 +24,26 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 unsigned long lastMsgTime = 0;
-const long interval = 10000; // Publish data every 10 seconds
+const long    interval    = 10000;  // Vitals publish interval: 10 seconds
+
+// --- Blood Pressure: updated every 30 minutes ---
+// BP cannot be measured every 10 s; keep last reading and refresh slowly.
+const long    BP_INTERVAL = 1800000UL;  // 30 min in ms  (change to 3600000UL for 1 hr)
+unsigned long lastBPTime  = 0 - BP_INTERVAL; // force a reading on first loop
+int           bp_sys      = 118;            // initial healthy baseline
+int           bp_dia      = 75;
+
+// ---------------------------------------------------------------------------
+// randFloat(lo, hi, decimals)
+// Returns a float in [lo, hi] rounded to `decimals` decimal places.
+// Uses integer random() for portability on ESP32.
+// ---------------------------------------------------------------------------
+float randFloat(float lo, float hi, int decimals) {
+  long scale = 1;
+  for (int i = 0; i < decimals; i++) scale *= 10;
+  long r = random((long)(lo * scale), (long)(hi * scale) + 1);
+  return (float)r / scale;
+}
 
 // --- NTP Configuration ---
 const char* ntp_server = "pool.ntp.org";
@@ -82,30 +94,9 @@ void setup() {
   // Set the MQTT Server (The Raspberry Pi's IP)
   client.setServer(mqtt_server, mqtt_port);
 
-  // --- Sensor Initialization ---
-  Wire.begin();                          // Start I2C bus
-
-  if (!mlx.begin()) {
-    Serial.println("ERROR: MLX90614 not found! Check wiring.");
-  } else {
-    Serial.println("MLX90614 ready.");
-  }
-
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("ERROR: MAX30102 not found! Check wiring.");
-  } else {
-    particleSensor.setup();
-    particleSensor.setPulseAmplitudeRed(0x0A);
-    particleSensor.setPulseAmplitudeGreen(0);
-    Serial.println("MAX30102 ready.");
-  }
-
-  dht.begin();
-  Serial.println("DHT22 ready.");
-
-  // BP sensor communicates over UART (Serial2)
-  Serial2.begin(9600, SERIAL_8N1, BP_RX_PIN, BP_TX_PIN);
-  Serial.println("BP UART (Serial2) ready.");
+  // Seed the random number generator with an unconnected ADC pin for entropy
+  randomSeed(analogRead(0));
+  Serial.println("[RANDOM VITALS MODE] Sending simulated sensor data.");
 
   // Wait for WiFi then start NTP sync
   unsigned long wifiWait = millis();
@@ -134,38 +125,30 @@ void loop() {
   if (now - lastMsgTime > interval) {
     lastMsgTime = now;
 
-    // 1. Read values from sensors
+    // 1. Generate bounded random vital readings (healthy baselines)
 
-    // --- MLX90614: IR Body Temperature ---
-    float body_temperature = mlx.readObjectTempC();
-    if (isnan(body_temperature)) body_temperature = -1.0;  // -1 flags a read error
+    // --- Heart Rate: 60–85 bpm (normal resting range) ---
+    int   heart_rate       = (int)randFloat(60, 85, 0);
 
-    // --- MAX30102: Heart Rate & SpO2 ---
-    // Read one sample from the FIFO. For production, use a rolling
-    // average over ~100 samples; this is the minimal single-read approach.
-    long irValue  = particleSensor.getIR();
-    long redValue = particleSensor.getRed();
-    // Simple ratio-based SpO2 estimate (replace with full algorithm if needed)
-    int heart_rate = (irValue > 50000) ? checkForBeat(irValue) ? 75 : 0 : 0;
-    int spo2       = (irValue > 50000 && redValue > 0)
-                         ? (int)(110.0 - 25.0 * ((float)redValue / irValue))
-                         : -1;  // -1 flags no finger detected
+    // --- SpO2: 96–99 % (healthy range) ---
+    int   spo2             = (int)randFloat(96, 99, 0);
 
-    // --- DHT22: Room Temperature & Humidity ---
-    float room_temperature = dht.readTemperature();
-    float humidity         = dht.readHumidity();
-    if (isnan(room_temperature)) room_temperature = -1.0;
-    if (isnan(humidity))         humidity          = -1.0;
+    // --- Body Temperature: 36.4–37.4 °C (normal oral range) ---
+    float body_temperature = randFloat(36.4, 37.4, 1);
 
-    // --- BP TTL Module: Blood Pressure via UART ---
-    // The BP module sends a 4-byte packet: [0xFF, SYS, DIA, 0x00]
-    int bp_sys = -1, bp_dia = -1;
-    if (Serial2.available() >= 4) {
-      if (Serial2.read() == 0xFF) {   // Wait for start byte
-        bp_sys = Serial2.read();
-        bp_dia = Serial2.read();
-        Serial2.read();               // Discard end byte
-      }
+    // --- Room Temperature: 24–32 °C ---
+    float room_temperature = randFloat(24.0, 32.0, 1);
+
+    // --- Humidity: 45–70 % RH ---
+    float humidity         = randFloat(45.0, 70.0, 1);
+
+    // --- Blood Pressure: refresh only every BP_INTERVAL (30 min) ---
+    // sys: 108–125 mmHg  |  dia: 62–79 mmHg  (healthy / pre-hypertension boundary)
+    if (now - lastBPTime >= BP_INTERVAL) {
+      lastBPTime = now;
+      bp_sys = (int)randFloat(108, 125, 0);
+      bp_dia = (int)randFloat(62,  79,  0);  // dia always < 80 (healthy)
+      Serial.println("[BP] Reading updated.");
     }
 
     // 2. Create a JSON document to pack the data neatly
